@@ -1,20 +1,20 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env::{args_os, var_os},
     ffi::{CString, OsStr, OsString},
     io::{Cursor, Read},
     os::unix::prelude::OsStrExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-use color_eyre::{eyre::eyre, Result};
-use log::{debug, info, warn};
-use reqwest::{
-    header::{HeaderMap, HeaderValue},
-    ClientBuilder,
+use color_eyre::{
+    eyre::{bail, eyre, Context},
+    Result,
 };
+use log::{debug, error, info, warn};
+use reqwest::{header::HeaderValue, Client, ClientBuilder};
 use serde::Deserialize;
-use tokio::fs;
+use tokio::{fs, io::AsyncWriteExt};
 
 #[derive(Debug, Clone, Deserialize)]
 struct ReleaseInfo {
@@ -23,8 +23,57 @@ struct ReleaseInfo {
     body: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct Globals {
+    game_directory: PathBuf,
+    versions: HashMap<String, String>,
+    client: Client,
+}
+
+impl Globals {
+    async fn new() -> Result<Self> {
+        let game_directory = locate_game_directory()
+            .await
+            .wrap_err_with(|| "could not find game directory")?;
+
+        let client = ClientBuilder::new()
+            .user_agent("poe2filter")
+            .build()
+            .wrap_err_with(|| "could not create an HTTP client")?;
+
+        let mut versions = HashMap::default();
+        if let Ok(store) = fs::read_to_string(releases_file(&game_directory)).await {
+            if let Ok(existing_versions) = serde_json::from_str(&store).inspect_err(|error| {
+                error!("could not read existing files, starting from scratch: {error}")
+            }) {
+                versions = existing_versions;
+            }
+        }
+
+        Ok(Globals {
+            game_directory,
+            versions,
+            client,
+        })
+    }
+}
+
 fn main() -> Result<()> {
     pretty_env_logger::init_custom_env("POE2FILTER_LOG");
+
+    let sep = OsString::from("--");
+    let mut args: VecDeque<_> = args_os().collect();
+
+    debug!("args are {args:?}");
+    args.pop_front(); // Remove "poe2filter"
+
+    let mut sources = Vec::new();
+    while let Some(front) = args.pop_front() {
+        if front == sep {
+            break;
+        }
+        sources.push(front);
+    }
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -32,20 +81,7 @@ fn main() -> Result<()> {
             .build()
             .expect("spawn async runtime");
 
-        rt.block_on(async_main())?;
-    }
-
-    // Future-proof, do nothing if there isn't a chained exec separator
-
-    let sep = OsString::from("--");
-    let mut args: VecDeque<_> = args_os().collect();
-
-    debug!("args are {args:?}");
-
-    while let Some(front) = args.pop_front() {
-        if front == sep {
-            break;
-        }
+        rt.block_on(async_main(sources))?;
     }
 
     let Some(path) = args.front().cloned() else {
@@ -61,55 +97,92 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn to_cstr(os: &OsStr) -> CString {
-    let mut bytes = os.as_bytes().to_vec();
-    bytes.push(0);
-    CString::from_vec_with_nul(bytes).unwrap()
+async fn async_main(sources: Vec<OsString>) -> Result<()> {
+    let mut globals = Globals::new().await?;
+
+    for source in sources {
+        let source = source
+            .to_str()
+            .ok_or_else(|| eyre!("all arguments must be valid UTF-8"))?;
+
+        let source = match source {
+            "neversink-lite" => "github:NeverSinkDev/NeverSink-PoE2litefilter",
+            "cdrg" => "github:cdrg/cdr-poe2filter",
+            other => other,
+        };
+
+        let index = source
+            .find(':')
+            .ok_or_else(|| eyre!("all arguments must be in the form source:arg"))?;
+        let (source_name, value) = source.split_at(index);
+
+        let current_version = globals.versions.get(source);
+        info!(
+            "updating {source} which has watermark {}...",
+            current_version.map(|v| v.as_str()).unwrap_or("none")
+        );
+        let next_version = match source_name {
+            "github" => get_github(&globals, &value[1..], current_version).await?,
+            _ => bail!("source type must be github"),
+        };
+
+        info!("watermark for {source} set to {next_version}");
+        globals.versions.insert(source.to_string(), next_version);
+    }
+
+    info!("saving watermark");
+    let s = serde_json::to_string_pretty(&globals.versions)?;
+    let mut o = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&releases_file(&globals.game_directory))
+        .await?;
+    o.write_all(s.as_bytes()).await?;
+
+    info!("saved watermark");
+    Ok(())
 }
 
-async fn async_main() -> color_eyre::Result<()> {
-    info!("finding game directory");
-    let dir = locate_game_directory().await?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2022-11-28"),
-    );
-
-    let client = ClientBuilder::new()
-        .default_headers(headers)
-        .user_agent("poe2filter")
-        .build()?;
+async fn get_github(globals: &Globals, value: &str, existing: Option<&String>) -> Result<String> {
+    static API_VERSION: HeaderValue = HeaderValue::from_static("2022-11-28");
+    static API_JSON_TYPE: HeaderValue = HeaderValue::from_static("application/vnd.github+json");
 
     info!("fetching latest release");
-    let releases = client.get("https://api.github.com/repos/NeverSinkDev/NeverSink-PoE2litefilter/releases?per_page=1&page=0")
-        .header("Accept",  HeaderValue::from_static("application/vnd.github+json"))
+    let releases = globals
+        .client
+        .get(format!(
+            "https://api.github.com/repos/{value}/releases?per_page=1&page=0"
+        ))
+        .header("X-Github-Api-Version", API_VERSION.clone())
+        .header("Accept", API_JSON_TYPE.clone())
         .send()
         .await?
+        .error_for_status()?
         .json::<Vec<ReleaseInfo>>()
         .await?;
 
     let release = releases
-        .first()
+        .into_iter()
+        .next()
         .ok_or_else(|| eyre!("no release could be found"))?;
 
     info!("found release with tag: {}", release.tag_name);
 
-    let current_file = dir.join("installed_tag");
-    if let Ok(installed_tag) = fs::read_to_string(&current_file).await {
-        if installed_tag == release.tag_name {
-            info!("filter is up to date, nothing to do");
-            return Ok(());
-        }
+    if existing == Some(&release.tag_name) {
+        info!("source is up to date");
+        return Ok(release.tag_name);
     }
 
+    eprintln!("# github:{value}: {}", &release.tag_name);
     if let Some(body) = release.body.as_ref() {
         eprintln!("{body}");
     }
+    eprintln!();
 
     info!("downloading release zipball");
-    let zipball = client
+    let zipball = globals
+        .client
         .get(&release.zipball_url)
         .send()
         .await?
@@ -130,7 +203,7 @@ async fn async_main() -> color_eyre::Result<()> {
             continue;
         }
 
-        info!("extracting ${filename}");
+        info!("extracting {filename}");
         let mut file = zipfile.by_name(&filename)?;
         file_data.clear();
         file.read_to_end(&mut file_data)?;
@@ -143,9 +216,9 @@ async fn async_main() -> color_eyre::Result<()> {
             continue;
         };
 
-        let full_path = dir.join(&filename);
+        let full_path = globals.game_directory.join(&filename);
 
-        info!("writing ${full_path:?}");
+        info!("writing {full_path:?}");
         let mut dest = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -153,21 +226,12 @@ async fn async_main() -> color_eyre::Result<()> {
             .open(full_path)
             .await?;
 
-        tokio::io::copy(&mut Cursor::new(&file_data), &mut dest).await?;
+        dest.write_all(&file_data).await?;
     }
 
-    info!("writing update info to {current_file:?}...");
-    let mut dest = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(current_file)
-        .await?;
-    tokio::io::copy(&mut Cursor::new(release.tag_name.as_bytes()), &mut dest).await?;
+    info!("updated github:{value}");
 
-    info!("update complete");
-
-    Ok(())
+    Ok(release.tag_name)
 }
 
 fn split_paths(raw: OsString) -> Vec<PathBuf> {
@@ -256,4 +320,14 @@ async fn locate_game_directory() -> Result<PathBuf> {
     }
 
     Err(color_eyre::eyre::eyre!("No steam path could be located"))
+}
+
+fn releases_file(path: &Path) -> PathBuf {
+    path.join("filter_watermarks.json")
+}
+
+fn to_cstr(os: &OsStr) -> CString {
+    let mut bytes = os.as_bytes().to_vec();
+    bytes.push(0);
+    CString::from_vec_with_nul(bytes).unwrap()
 }
